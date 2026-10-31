@@ -1,0 +1,468 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p AdCloser && cd AdCloser
+          mkdir -p app
+          cat > app/build.gradle.kts <<'ADCLOSER_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.manal.adcloser"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.manal.adcloser"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          ADCLOSER_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'ADCLOSER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AdCloserService"
+                      android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          ADCLOSER_EOF
+          mkdir -p app/src/main/java/com/manal/adcloser
+          cat > app/src/main/java/com/manal/adcloser/AdCloserService.kt <<'ADCLOSER_EOF'
+          package com.manal.adcloser
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          /**
+           * Watches the games you selected. When a full-screen ad screen opens, it keeps
+           * looking for a close / skip button and taps it as soon as it appears.
+           */
+          class AdCloserService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+
+              // Class-name fragments used by the common ad SDKs.
+              private val adClassHints = listOf(
+                  "com.google.android.gms.ads",
+                  "com.unity3d.ads",
+                  "com.unity3d.services.ads",
+                  "com.applovin",
+                  "com.ironsource",
+                  "com.vungle",
+                  "com.facebook.ads",
+                  "com.chartboost",
+                  "com.mbridge",
+                  "com.bytedance.sdk.openadsdk",
+                  "com.inmobi",
+                  "com.fyber",
+                  "com.mintegral",
+                  "com.adcolony",
+                  "com.startapp",
+                  "com.smaato",
+                  "net.pubnative",
+                  "AdActivity"
+              )
+
+              private val exactCloseLabels = setOf(
+                  "x", "×", "✕", "✖", "✗", "close", "close ad", "skip", "skip ad",
+                  "dismiss", "no thanks", "not now", "continue"
+              )
+
+              private val idHints = listOf("close", "skip", "dismiss", "btn_x", "cancel_ad")
+
+              private var scanning = false
+              private var scanPkg: String? = null
+              private var ticks = 0
+              private var lastWindowClass: String = ""
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+                  event ?: return
+                  val pkg = event.packageName?.toString() ?: return
+                  if (!Prefs.getGames(this).contains(pkg)) return
+
+                  if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                      val cls = event.className?.toString() ?: ""
+                      lastWindowClass = cls
+                      if (isAdClass(cls)) {
+                          startScan(pkg)
+                      }
+                  }
+              }
+
+              private fun isAdClass(cls: String): Boolean =
+                  adClassHints.any { cls.contains(it, ignoreCase = true) }
+
+              private fun startScan(pkg: String) {
+                  if (scanning && scanPkg == pkg) return
+                  scanning = true
+                  scanPkg = pkg
+                  ticks = 0
+                  handler.removeCallbacks(scanRunnable)
+                  handler.post(scanRunnable)
+              }
+
+              private fun stopScan() {
+                  scanning = false
+                  scanPkg = null
+                  handler.removeCallbacks(scanRunnable)
+              }
+
+              private val scanRunnable = object : Runnable {
+                  override fun run() {
+                      if (!scanning) return
+
+                      // Stop when the ad screen is gone or after about 60 seconds.
+                      if (!isAdClass(lastWindowClass) || ticks > 150) {
+                          stopScan()
+                          return
+                      }
+                      ticks++
+
+                      val root = rootInActiveWindow
+                      if (root != null && root.packageName?.toString() == scanPkg) {
+                          if (tryCloseWithLabels(root) || (ticks >= 8 && tryCloseCornerButton(root))) {
+                              // Give the ad a moment to close, then keep checking in case
+                              // another ad screen follows.
+                              handler.postDelayed(this, 800)
+                              return
+                          }
+                          if (ticks == 2) {
+                              // Some ads respond to Back.
+                              performGlobalAction(GLOBAL_ACTION_BACK)
+                          }
+                      }
+                      handler.postDelayed(this, 400)
+                  }
+              }
+
+              /** Looks for a node whose text, description or view id says close / skip. */
+              private fun tryCloseWithLabels(root: AccessibilityNodeInfo): Boolean {
+                  val match = findNode(root, 0) { node ->
+                      val text = node.text?.toString()?.trim()?.lowercase() ?: ""
+                      val desc = node.contentDescription?.toString()?.trim()?.lowercase() ?: ""
+                      val id = node.viewIdResourceName?.lowercase() ?: ""
+                      text in exactCloseLabels ||
+                          desc in exactCloseLabels ||
+                          text.startsWith("skip") ||
+                          desc.startsWith("close") ||
+                          desc.startsWith("skip") ||
+                          idHints.any { id.contains(it) }
+                  }
+                  return match != null && click(match)
+              }
+
+              /**
+               * Fallback for icon-only X buttons with no label: a small clickable view
+               * in the top corners of the screen.
+               */
+              private fun tryCloseCornerButton(root: AccessibilityNodeInfo): Boolean {
+                  val screen = Rect()
+                  root.getBoundsInScreen(screen)
+                  if (screen.width() == 0 || screen.height() == 0) return false
+
+                  val match = findNode(root, 0) { node ->
+                      if (!node.isClickable) return@findNode false
+                      val r = Rect()
+                      node.getBoundsInScreen(r)
+                      val small = r.width() < screen.width() * 0.2 && r.height() < screen.width() * 0.2
+                      val top = r.centerY() < screen.top + screen.height() * 0.2
+                      val corner = r.centerX() < screen.left + screen.width() * 0.25 ||
+                          r.centerX() > screen.right - screen.width() * 0.25
+                      small && top && corner && r.width() > 0
+                  }
+                  return match != null && click(match)
+              }
+
+              private fun findNode(
+                  node: AccessibilityNodeInfo,
+                  depth: Int,
+                  predicate: (AccessibilityNodeInfo) -> Boolean
+              ): AccessibilityNodeInfo? {
+                  if (depth > 40) return null
+                  if (predicate(node)) return node
+                  for (i in 0 until node.childCount) {
+                      val child = node.getChild(i) ?: continue
+                      val found = findNode(child, depth + 1, predicate)
+                      if (found != null) return found
+                  }
+                  return null
+              }
+
+              private fun click(node: AccessibilityNodeInfo): Boolean {
+                  var target: AccessibilityNodeInfo? = node
+                  var hops = 0
+                  while (target != null && hops < 6) {
+                      if (target.isClickable && target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                          return true
+                      }
+                      target = target.parent
+                      hops++
+                  }
+                  // Last resort: tap the middle of the node on screen.
+                  val r = Rect()
+                  node.getBoundsInScreen(r)
+                  if (r.width() <= 0 || r.height() <= 0) return false
+                  val path = Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()) }
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+                      .build()
+                  return dispatchGesture(gesture, null, null)
+              }
+
+              override fun onInterrupt() {
+                  stopScan()
+              }
+
+              override fun onDestroy() {
+                  stopScan()
+                  super.onDestroy()
+              }
+          }
+          ADCLOSER_EOF
+          mkdir -p app/src/main/java/com/manal/adcloser
+          cat > app/src/main/java/com/manal/adcloser/MainActivity.kt <<'ADCLOSER_EOF'
+          package com.manal.adcloser
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(pad, pad, pad, pad)
+                  }
+
+                  status = TextView(this).apply { textSize = 16f }
+                  root.addView(status)
+
+                  val enableBtn = Button(this).apply {
+                      text = "Open Accessibility settings"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                      }
+                  }
+                  root.addView(enableBtn)
+
+                  root.addView(TextView(this).apply {
+                      text = "\nPick the games to watch:"
+                      textSize = 16f
+                      gravity = Gravity.START
+                  })
+
+                  val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  val scroll = ScrollView(this).apply { addView(list) }
+                  root.addView(
+                      scroll,
+                      LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                      )
+                  )
+
+                  val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = packageManager.queryIntentActivities(launcherIntent, 0)
+                      .map { it.activityInfo.packageName to it.loadLabel(packageManager).toString() }
+                      .filter { it.first != packageName }
+                      .distinctBy { it.first }
+                      .sortedBy { it.second.lowercase() }
+
+                  val selected = Prefs.getGames(this)
+                  for ((pkg, label) in apps) {
+                      list.addView(CheckBox(this).apply {
+                          text = label
+                          isChecked = selected.contains(pkg)
+                          setOnCheckedChangeListener { _, checked ->
+                              Prefs.setGame(this@MainActivity, pkg, checked)
+                          }
+                      })
+                  }
+
+                  setContentView(root)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  status.text = if (isServiceEnabled()) {
+                      "Service is ON. Ads in the selected games will be closed."
+                  } else {
+                      "Service is OFF. Tap the button below, find \"Ad Closer\" and turn it on."
+                  }
+              }
+
+              private fun isServiceEnabled(): Boolean {
+                  val enabled = Settings.Secure.getString(
+                      contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ) ?: return false
+                  return enabled.split(':').any {
+                      it.startsWith("$packageName/", ignoreCase = true)
+                  }
+              }
+          }
+          ADCLOSER_EOF
+          mkdir -p app/src/main/java/com/manal/adcloser
+          cat > app/src/main/java/com/manal/adcloser/Prefs.kt <<'ADCLOSER_EOF'
+          package com.manal.adcloser
+
+          import android.content.Context
+
+          object Prefs {
+              private const val FILE = "adcloser"
+              private const val KEY_GAMES = "games"
+
+              fun getGames(context: Context): Set<String> =
+                  context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+                      .getStringSet(KEY_GAMES, emptySet()) ?: emptySet()
+
+              fun setGame(context: Context, pkg: String, enabled: Boolean) {
+                  val current = getGames(context).toMutableSet()
+                  if (enabled) current.add(pkg) else current.remove(pkg)
+                  context.getSharedPreferences(FILE, Context.MODE_PRIVATE)
+                      .edit()
+                      .putStringSet(KEY_GAMES, current)
+                      .apply()
+              }
+          }
+          ADCLOSER_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'ADCLOSER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Ad Closer</string>
+              <string name="service_description">Detects full-screen ads in the games you choose and closes them automatically. It only reads the screen of the selected games and does not collect or send any data.</string>
+          </resources>
+          ADCLOSER_EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'ADCLOSER_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="100"
+              android:description="@string/service_description" />
+          ADCLOSER_EOF
+          cat > build.gradle.kts <<'ADCLOSER_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          ADCLOSER_EOF
+          cat > gradle.properties <<'ADCLOSER_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          ADCLOSER_EOF
+          cat > settings.gradle.kts <<'ADCLOSER_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "AdCloser"
+          include(":app")
+          ADCLOSER_EOF
+      - name: Build APK
+        working-directory: AdCloser
+        run: gradle :app:assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AdCloser-apk
+          path: AdCloser/app/build/outputs/apk/debug/app-debug.apk
+          
